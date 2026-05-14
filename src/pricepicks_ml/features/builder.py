@@ -7,9 +7,49 @@ import pandas as pd
 
 from pricepicks_ml.features.context import is_back_to_back, matches_in_last_days, rest_days
 from pricepicks_ml.features.line_relative import vectorized_mean_minus_line, vectorized_z_gap
-from pricepicks_ml.features.opponent import gather_opponent_prior_games, opponent_allowed_prior
 from pricepicks_ml.features.rolling import rolling_stats
 from pricepicks_ml.features.time_adjusted import per_36, per_90
+
+
+def _opponent_allowed_feature_names(windows: tuple[int, ...]) -> list[str]:
+    stat_names = ("mean", "median", "std", "p25", "p75", "wmean")
+    return [f"opp_allowed_{n}_{name}" for n in windows for name in stat_names]
+
+
+def _precompute_opponent_allowed_features(
+    games: pd.DataFrame,
+    *,
+    stat_col: str,
+    windows: tuple[int, ...],
+    lam: float,
+) -> pd.DataFrame:
+    """Return prior-only opponent features without repeatedly scanning ``games``.
+
+    Each current row uses only rows with the same defensive team/position bucket
+    and an earlier timestamp, matching ``gather_opponent_prior_games`` semantics.
+    """
+    feature_names = _opponent_allowed_feature_names(windows)
+    out = pd.DataFrame(np.nan, index=games.index, columns=feature_names)
+    grouped = games.sort_values("official_start_ts").groupby(
+        ["opponent_team_id", "position_bucket"],
+        sort=False,
+    )
+
+    for _, group in grouped:
+        history: list[float] = []
+        for _, same_ts in group.groupby("official_start_ts", sort=True):
+            vals = np.asarray(history, dtype=float)
+            feat_values: dict[str, float] = {}
+            for n in windows:
+                tail = vals[-n:] if len(vals) else vals
+                stats = rolling_stats(tail, lam=lam)
+                for key, value in stats.items():
+                    feat_values[f"opp_allowed_{n}_{key}"] = value
+            for key, value in feat_values.items():
+                out.loc[same_ts.index, key] = value
+            history.extend(same_ts[stat_col].astype(float).tolist())
+
+    return out
 
 
 def build_feature_matrix(
@@ -33,6 +73,7 @@ def build_feature_matrix(
     g = games.copy()
     g["official_start_ts"] = pd.to_datetime(g["official_start_ts"])
     g = g.sort_values(["player_id", "official_start_ts"]).reset_index(drop=True)
+    opponent_features = _precompute_opponent_allowed_features(g, stat_col=stat_col, windows=windows, lam=lam)
 
     feats: list[dict] = []
     history_by_player: dict[str, list[dict]] = {}
@@ -69,15 +110,7 @@ def build_feature_matrix(
                 per90 = np.array([per_90(s, m) for s, m in zip(tail_s, tail_m)])
                 out[f"roll_{n}_per90_mean"] = float(np.nanmean(per90)) if per90.size else float("nan")
 
-        opp_g = gather_opponent_prior_games(
-            g,
-            row["opponent_team_id"],
-            row["position_bucket"],
-            ts,
-            stat_col,
-        )
-        opp_feats = opponent_allowed_prior(opp_g, stat_col, str(row["position_bucket"]), windows=windows, lam=lam)
-        out.update(opp_feats)
+        out.update(opponent_features.loc[idx].to_dict())
 
         if team_games_lookup is not None:
             tss = team_games_lookup.get(str(row["team_id"]), [])
