@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end demo: synthetic BB data, features, walk-forward, HGB + calibration, metrics."""
+"""End-to-end demo: NBA data, features, walk-forward, HGB + calibration, metrics."""
 
 from __future__ import annotations
 
@@ -18,14 +18,14 @@ try:
 except ImportError:
     sys.path.insert(0, str(ROOT / "src"))
 
-from pricepicks_ml.baselines import fit_logistic_baseline, logistic_predict_proba, naive_prob_over
-from pricepicks_ml.calibration_util import choose_calibrator_kind, fit_calibrator
-from pricepicks_ml.evaluate import eval_report, reliability_table
-from pricepicks_ml.features.builder import attach_line_features, build_feature_matrix
-from pricepicks_ml.labels import LabelReport, attach_labels, drop_pushes, label_report
-from pricepicks_ml.synthetic import generate_basketball_demo
-from pricepicks_ml.train import fit_hgb, predict_proba
-from pricepicks_ml.walk_forward import all_folds, split_frame
+from pricepicks_ml.baselines import fit_logistic_baseline, logistic_predict_proba, naive_prob_over  # noqa: E402
+from pricepicks_ml.calibration_util import choose_calibrator_kind, fit_calibrator  # noqa: E402
+from pricepicks_ml.evaluate import eval_report, reliability_table  # noqa: E402
+from pricepicks_ml.features.builder import attach_line_features, build_feature_matrix  # noqa: E402
+from pricepicks_ml.labels import LabelReport, attach_labels, drop_pushes, label_report  # noqa: E402
+from pricepicks_ml.nba_data import DEFAULT_MAX_PLAYERS, DEFAULT_SEASONS, load_nba_demo_data  # noqa: E402
+from pricepicks_ml.train import fit_hgb, predict_proba  # noqa: E402
+from pricepicks_ml.walk_forward import all_folds, split_frame  # noqa: E402
 
 
 def median_impute(train: pd.DataFrame, val: pd.DataFrame, cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -113,8 +113,32 @@ def _print_reliability(rel: pd.DataFrame) -> None:
         )
 
 
+def _write_input_csvs(games: pd.DataFrame, lines: pd.DataFrame, artifact_dir: Path) -> None:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    games.to_csv(artifact_dir / "nba_player_games.csv", index=False)
+    lines.to_csv(artifact_dir / "nba_estimated_lines.csv", index=False)
+    print("Wrote data/artifacts/nba_player_games.csv")
+    print("Wrote data/artifacts/nba_estimated_lines.csv")
+
+
+def _write_metrics_csv(rows: list[dict], artifact_dir: Path) -> None:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    pd.json_normalize(rows).to_csv(artifact_dir / "walkforward_metrics.csv", index=False)
+    print("Wrote data/artifacts/walkforward_metrics.csv")
+
+
 def main() -> None:
-    games, lines, team_lookup = generate_basketball_demo()
+    artifact_dir = Path("data/artifacts")
+    print(
+        f"Loading NBA player game logs for seasons: {', '.join(DEFAULT_SEASONS)} "
+        f"(top {DEFAULT_MAX_PLAYERS} players by games played)"
+    )
+    games, lines, team_lookup = load_nba_demo_data(seasons=DEFAULT_SEASONS, max_players=DEFAULT_MAX_PLAYERS)
+    print(
+        f"Loaded {len(games):,} real player-game rows and "
+        f"{len(lines):,} estimated prior-average lines."
+    )
+    _write_input_csvs(games, lines, artifact_dir)
     raw_feats = build_feature_matrix(
         games,
         stat_col="stat_pts",
@@ -124,12 +148,14 @@ def main() -> None:
     df = attach_line_features(raw_feats, lines, stat_col="stat_pts", line_col="line_value")
     df = attach_labels(df, col_realized="realized_stat", col_line="line_value")
     df = drop_pushes(df)
+    df.to_csv(artifact_dir / "nba_training_rows.csv", index=False)
+    print("Wrote data/artifacts/nba_training_rows.csv")
     rep = label_report(df["y_over"].tolist())
     _print_label_block(rep)
 
     folds = all_folds(df, "official_start_ts", embargo_days=0)
     if len(folds) < 2:
-        print("Not enough months for walk-forward; extend synthetic span.")
+        print("Not enough months for walk-forward; add more NBA seasons.")
         return
 
     feature_cols = [c for c in df.columns if c not in {"player_id", "match_id", "official_start_ts", "team_id", "opponent_team_id", "position_bucket", "realized_stat", "y_over"}]
@@ -143,7 +169,6 @@ def main() -> None:
         y_tr = tr["y_over"].to_numpy()
         y_va = va["y_over"].to_numpy()
 
-        naive_p = naive_prob_over(tr["roll_10_mean"].to_numpy(), tr["line_value"].to_numpy())
         naive_p_va = naive_prob_over(va["roll_10_mean"].to_numpy(), va["line_value"].to_numpy())
 
         log_pipe = fit_logistic_baseline(tr_x[feature_cols], y_tr)
@@ -177,8 +202,8 @@ def main() -> None:
         rel = reliability_table(y_va, p_va, n_bins=8)
         _print_reliability(rel)
 
-    Path("data/artifacts").mkdir(parents=True, exist_ok=True)
-    with open("data/artifacts/demo_walkforward.json", "w", encoding="utf-8") as f:
+    _write_metrics_csv(rows, artifact_dir)
+    with open(artifact_dir / "demo_walkforward.json", "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=2)
     print()
     print("Wrote data/artifacts/demo_walkforward.json")
